@@ -22,50 +22,59 @@ jobs:
           PROJECT_ID: PVT_kwHOABtUSs4A1sl-
           OWNER: mikebronner
         run: |
+          set +e  # Don't exit on individual item failures
+
           echo "🔍 Fetching all open issues and PRs..."
           ADDED=0
           SKIPPED=0
+          FAILED=0
           PAGE=1
 
           while true; do
-            # Search API: all open issues+PRs across all repos for this owner
-            RESULTS=$(gh api "search/issues?q=is:open+is:unmerged+owner:${OWNER}&per_page=100&page=${PAGE}" \
-              --jq '.items[] | {nodeId: .node_id, type: (if .pull_request then "PR" else "Issue" end), title: .title, url: .html_url}')
+            RESPONSE=$(gh api "search/issues?q=is:open+owner:${OWNER}&per_page=100&page=${PAGE}" 2>&1)
+            if [ $? -ne 0 ]; then
+              echo "❌ Search API failed: $RESPONSE"
+              exit 1
+            fi
 
-            COUNT=$(echo "$RESULTS" | jq -s 'length')
+            COUNT=$(echo "$RESPONSE" | jq '.items | length')
             [ "$COUNT" -eq 0 ] && break
 
             echo "📄 Page $PAGE: $COUNT items"
 
-            # Add each to the project
-            while IFS= read -r item; do
-              NODE_ID=$(echo "$item" | jq -r '.nodeId')
-              TITLE=$(echo "$item" | jq -r '.title' | cut -c1-60)
+            # Process each item
+            for i in $(seq 0 $((COUNT - 1))); do
+              NODE_ID=$(echo "$RESPONSE" | jq -r ".items[$i].node_id")
+              TITLE=$(echo "$RESPONSE" | jq -r ".items[$i].title" | cut -c1-60)
 
-              RESULT=$(gh api graphql -f query='
-                mutation($projectId: ID!, $contentId: ID!) {
-                  addProjectV2ItemById(input: {
-                    projectId: $projectId
-                    contentId: $contentId
-                  }) {
+              RESULT=$(gh api graphql \
+                -f query='mutation($projectId: ID!, $contentId: ID!) {
+                  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
                     item { id }
                   }
-                }
-              ' -f projectId="$PROJECT_ID" -f contentId="$NODE_ID" 2>&1)
+                }' \
+                -f projectId="$PROJECT_ID" \
+                -f contentId="$NODE_ID" 2>&1)
 
               if echo "$RESULT" | grep -q '"id"'; then
                 ADDED=$((ADDED + 1))
                 echo "  ✅ $TITLE"
-              else
+              elif echo "$RESULT" | grep -qi "already exists\|already added"; then
                 SKIPPED=$((SKIPPED + 1))
-                echo "  ⏭️  $TITLE (already in project or error)"
+              else
+                FAILED=$((FAILED + 1))
+                echo "  ❌ $TITLE"
+                echo "     $RESULT" | head -2
               fi
-            done < <(echo "$RESULTS" | jq -c '.')
+            done
 
-            # If fewer than 100 results, we're done
             [ "$COUNT" -lt 100 ] && break
             PAGE=$((PAGE + 1))
           done
 
           echo ""
-          echo "✅ Done! Added: $ADDED | Skipped/existing: $SKIPPED"
+          echo "✅ Done! Added: $ADDED | Already in project: $SKIPPED | Failed: $FAILED"
+
+          # Fail the workflow if nothing worked at all
+          [ $((ADDED + SKIPPED)) -eq 0 ] && [ $FAILED -gt 0 ] && exit 1
+          exit 0
