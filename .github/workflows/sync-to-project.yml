@@ -2,7 +2,7 @@ name: Sync Issues & PRs to Project
 
 on:
   schedule:
-    - cron: '0 3 * * *'  # Daily at 3 AM UTC
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
   workflow_dispatch:      # Manual trigger anytime
 
 jobs:
@@ -14,13 +14,14 @@ jobs:
           GH_TOKEN: ${{ secrets.HOBBES }}
           PROJECT_ID: PVT_kwHOABtUSs4A1sl-
           OWNER: mikebronner
+          BATCH_SIZE: 20
         run: |
           set +e
 
           echo "🔍 Fetching all open issues and PRs..."
-          ADDED=0
-          SKIPPED=0
-          FAILED=0
+
+          # Step 1: Collect ALL node IDs across all pages first
+          NODE_IDS=()
           PAGE=1
 
           while true; do
@@ -36,32 +37,56 @@ jobs:
             echo "📄 Page $PAGE: $COUNT items"
 
             for i in $(seq 0 $((COUNT - 1))); do
-              NODE_ID=$(echo "$RESPONSE" | jq -r ".items[$i].node_id")
-              TITLE=$(echo "$RESPONSE" | jq -r ".items[$i].title" | cut -c1-60)
-
-              RESULT=$(gh api graphql \
-                -f query='mutation($projectId: ID!, $contentId: ID!) {
-                  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
-                    item { id }
-                  }
-                }' \
-                -f projectId="$PROJECT_ID" \
-                -f contentId="$NODE_ID" 2>&1)
-
-              if echo "$RESULT" | grep -q '"id"'; then
-                ADDED=$((ADDED + 1))
-                echo "  ✅ $TITLE"
-              elif echo "$RESULT" | grep -qi "already exists\|already added"; then
-                SKIPPED=$((SKIPPED + 1))
-              else
-                FAILED=$((FAILED + 1))
-                echo "  ❌ $TITLE"
-                echo "$RESULT" | head -1
-              fi
+              NODE_IDS+=("$(echo "$RESPONSE" | jq -r ".items[$i].node_id")")
             done
 
             [ "$COUNT" -lt 100 ] && break
             PAGE=$((PAGE + 1))
+          done
+
+          TOTAL=${#NODE_IDS[@]}
+          echo ""
+          echo "📊 Total items to sync: $TOTAL"
+          echo "🚀 Processing in batches of $BATCH_SIZE..."
+          echo ""
+
+          # Step 2: Send batched GraphQL mutations
+          ADDED=0
+          SKIPPED=0
+          FAILED=0
+
+          for ((start=0; start<TOTAL; start+=BATCH_SIZE)); do
+            end=$((start + BATCH_SIZE - 1))
+            [ $end -ge $TOTAL ] && end=$((TOTAL - 1))
+            BATCH_COUNT=$((end - start + 1))
+
+            echo "⚡ Batch $((start / BATCH_SIZE + 1)): items $((start + 1))–$((end + 1))"
+
+            # Build batched mutation (one request, multiple aliases)
+            MUTATION="mutation {"
+            for ((i=start; i<=end; i++)); do
+              MUTATION+=" add_${i}: addProjectV2ItemById(input: { projectId: \"${PROJECT_ID}\", contentId: \"${NODE_IDS[$i]}\" }) { item { id } }"
+            done
+            MUTATION+=" }"
+
+            RESULT=$(gh api graphql -f query="$MUTATION" 2>&1)
+
+            if echo "$RESULT" | grep -q '"errors"'; then
+              # Check if it's all FORBIDDEN or partial failures
+              ERR_COUNT=$(echo "$RESULT" | jq '.errors | length' 2>/dev/null || echo 0)
+              SUCCESS_COUNT=$(echo "$RESULT" | jq '[.data | to_entries[] | select(.value.item != null)] | length' 2>/dev/null || echo 0)
+              ALREADY_COUNT=$(echo "$RESULT" | jq '[.errors[] | select(.message | test("already|exists"; "i"))] | length' 2>/dev/null || echo 0)
+
+              ADDED=$((ADDED + SUCCESS_COUNT))
+              SKIPPED=$((SKIPPED + ALREADY_COUNT))
+              FAILED=$((FAILED + ERR_COUNT - ALREADY_COUNT))
+
+              echo "  ✅ $SUCCESS_COUNT added | ⏭️  $ALREADY_COUNT existing | ❌ $((ERR_COUNT - ALREADY_COUNT)) failed"
+            else
+              # All succeeded
+              ADDED=$((ADDED + BATCH_COUNT))
+              echo "  ✅ $BATCH_COUNT added"
+            fi
           done
 
           echo ""
