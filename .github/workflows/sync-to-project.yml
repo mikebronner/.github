@@ -1,0 +1,71 @@
+name: Sync Issues & PRs to Project
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+  workflow_dispatch:      # Manual trigger anytime
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Sync open issues and PRs to project
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PROJECT_ID: PVT_kwHOABtUSs4A1sl-
+          OWNER: mikebronner
+        run: |
+          echo "🔍 Fetching all open issues and PRs..."
+          ADDED=0
+          SKIPPED=0
+          PAGE=1
+
+          while true; do
+            # Search API: all open issues+PRs across all repos for this owner
+            RESULTS=$(gh api "search/issues?q=is:open+is:unmerged+owner:${OWNER}&per_page=100&page=${PAGE}" \
+              --jq '.items[] | {nodeId: .node_id, type: (if .pull_request then "PR" else "Issue" end), title: .title, url: .html_url}')
+
+            COUNT=$(echo "$RESULTS" | jq -s 'length')
+            [ "$COUNT" -eq 0 ] && break
+
+            echo "📄 Page $PAGE: $COUNT items"
+
+            # Add each to the project
+            while IFS= read -r item; do
+              NODE_ID=$(echo "$item" | jq -r '.nodeId')
+              TITLE=$(echo "$item" | jq -r '.title' | cut -c1-60)
+
+              RESULT=$(gh api graphql -f query='
+                mutation($projectId: ID!, $contentId: ID!) {
+                  addProjectV2ItemById(input: {
+                    projectId: $projectId
+                    contentId: $contentId
+                  }) {
+                    item { id }
+                  }
+                }
+              ' -f projectId="$PROJECT_ID" -f contentId="$NODE_ID" 2>&1)
+
+              if echo "$RESULT" | grep -q '"id"'; then
+                ADDED=$((ADDED + 1))
+                echo "  ✅ $TITLE"
+              else
+                SKIPPED=$((SKIPPED + 1))
+                echo "  ⏭️  $TITLE (already in project or error)"
+              fi
+            done < <(echo "$RESULTS" | jq -c '.')
+
+            # If fewer than 100 results, we're done
+            [ "$COUNT" -lt 100 ] && break
+            PAGE=$((PAGE + 1))
+          done
+
+          echo ""
+          echo "✅ Done! Added: $ADDED | Skipped/existing: $SKIPPED"
