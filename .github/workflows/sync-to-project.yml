@@ -5,24 +5,22 @@ on:
     - cron: '0 6 * * *'  # Daily at 6 AM UTC
   workflow_dispatch:      # Manual trigger anytime
 
+permissions:
+  issues: read
+  pull-requests: read
+  projects: write
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Generate App Token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
-
       - name: Sync open issues and PRs to project
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PROJECT_ID: PVT_kwHOABtUSs4A1sl-
           OWNER: mikebronner
         run: |
-          set +e  # Don't exit on individual item failures
+          set +e
 
           echo "🔍 Fetching all open issues and PRs..."
           ADDED=0
@@ -42,7 +40,6 @@ jobs:
 
             echo "📄 Page $PAGE: $COUNT items"
 
-            # Process each item
             for i in $(seq 0 $((COUNT - 1))); do
               NODE_ID=$(echo "$RESPONSE" | jq -r ".items[$i].node_id")
               TITLE=$(echo "$RESPONSE" | jq -r ".items[$i].title" | cut -c1-60)
@@ -64,7 +61,7 @@ jobs:
               else
                 FAILED=$((FAILED + 1))
                 echo "  ❌ $TITLE"
-                echo "     $RESULT" | head -2
+                echo "$RESULT" | head -1
               fi
             done
 
@@ -74,7 +71,5 @@ jobs:
 
           echo ""
           echo "✅ Done! Added: $ADDED | Already in project: $SKIPPED | Failed: $FAILED"
-
-          # Fail the workflow if nothing worked at all
           [ $((ADDED + SKIPPED)) -eq 0 ] && [ $FAILED -gt 0 ] && exit 1
           exit 0
